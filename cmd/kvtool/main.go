@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"kvschool/internal/kv"
+	"kvschool/internal/kv/lsmstore"
 	"kvschool/internal/kv/memmap"
 	"kvschool/internal/mapreduce"
 	"kvschool/internal/testutil"
@@ -150,7 +151,8 @@ func initStore(kind string) (kv.Store, error) {
 		return memmap.New(), nil
 	case "skiplist":
 		return memSkipListDefault(), nil
-	// case "lsm": будет добавлен в процессе выполнения заданий
+	case "lsm":
+		return lsmstore.Open(lsmstore.Options{Dir: "./lsm-data"})
 	default:
 		return nil, fmt.Errorf("неизвестное хранилище %q", kind)
 	}
