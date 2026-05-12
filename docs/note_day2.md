@@ -144,4 +144,31 @@ BenchmarkLSMStore_Get/N=10000   143 ns/op   16 B/op   1 alloc/op
 **Запуск бенчмарков:**
 ```bash
 go test -tags=day2 -bench=. -benchtime=3s -benchmem ./internal/kv/lsmstore/
+go test -tags=day2 -bench=BenchmarkSSTable_ReadRecord -benchtime=3s -benchmem -run=^$ ./internal/sstable/
+
 ```
+
+---
+
+## 6) Узкое место и оптимизация (уровень C)
+
+### Проблема
+
+`readRecord` в [internal/sstable/sstable.go](../internal/sstable/sstable.go) делал **5 отдельных `ReadAt` syscall** на одну запись (keyLen, key, opType, valLen, value). На пути `Scan` это 5×N syscall'ов, на пути `Get` — 5 на каждый проверяемый SSTable.
+
+### Фикс
+
+После чтения `keyLen` размер блока `key + opType + valLen` становится известен и читается **одним** `ReadAt`. `key` — slice внутрь общего буфера, отдельный `make` не нужен.
+
+Итого: **3 ReadAt вместо 5**, **3 аллокации вместо 4** на запись. Старая версия сохранена как `readRecordLegacy` только для бенчмарка; продакшн всегда использует `readRecordOptimized`.
+
+### Результат
+
+`BenchmarkSSTable_ReadRecord` за один прогон выводит обе ветки (полный обход SSTable из 10 000 записей, M1):
+
+```
+legacy_5_readat-8       168   21 241 885 ns/op   320 114 B/op   40 001 allocs/op
+optimized_3_readat-8    278   12 888 744 ns/op   440 099 B/op   30 001 allocs/op
+```
+
+Размен: +12 байт на запись (`hdr = keyLen+5` vs только `keyLen`) в обмен на минус один syscall. Окупается с запасом.

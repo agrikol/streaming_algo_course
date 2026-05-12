@@ -297,6 +297,16 @@ func (r *Reader) Iterator(start, end []byte) (*Iter, error) {
 	}, nil
 }
 
+// readMode — какой вариант readRecord использовать.
+// Продакшн-путь всегда использует readModeOptimized; readModeLegacy оставлен
+// исключительно для сравнительного бенчмарка уровня C
+type readMode uint8
+
+const (
+	readModeOptimized readMode = iota // 3 ReadAt на запись (по умолчанию)
+	readModeLegacy                    // 5 ReadAt на запись — старая версия
+)
+
 // Iter последовательно читает записи из SSTable начиная с заданного offset.
 // Поддерживает диапазонные запросы [start, end).
 type Iter struct {
@@ -307,6 +317,7 @@ type Iter struct {
 	end     []byte      // верхняя граница диапазона (исключительно)
 	seeked  bool        // флаг: уже нашли первый ключ >= start?
 	done    bool        // флаг: итерация завершена?
+	mode    readMode    // 0 = optimized (по умолчанию), 1 = legacy (только для бенчмарка)
 }
 
 // Next возвращает следующую пару ключ/значение из SSTable.
@@ -361,11 +372,73 @@ func (it *Iter) Next() (key, value []byte, ok bool, err error) {
 }
 
 // readRecord читает одну запись из io.ReaderAt начиная с it.offset.
-// Использует ReadAt (произвольный доступ) — не изменяет позицию файла.
+// По умолчанию использует оптимизированный путь (3 ReadAt). Если выставлен
+// it.mode == readModeLegacy — диспатчит на legacy-версию с 5 ReadAt.
 //
 // Возвращает (key, value, opType, totalBytesRead, error).
 // Если totalBytesRead == 0 — данных больше нет.
 func (it *Iter) readRecord() (key, value []byte, op byte, n int, err error) {
+	if it.mode == readModeLegacy {
+		return it.readRecordLegacy()
+	}
+	return it.readRecordOptimized()
+}
+
+// readRecordOptimized — продакшн-версия с 3 ReadAt на запись.
+//
+// Объединяет три фиксированных по позиции чтения (key, opType, valLen) в один
+// ReadAt: после того как известен keyLen, размер блока (key+opType+valLen)
+// предсказуем и читается одним syscall'ом. Дополнительно key — это slice
+// внутрь общего буфера hdr, без отдельного make.
+//
+// Итого: 3 ReadAt + 2 аллокации (hdr, value) на запись.
+func (it *Iter) readRecordOptimized() (key, value []byte, op byte, n int, err error) {
+	// Защита: если не хватает байт даже для keyLen — данные закончились
+	if it.offset+4 > it.dataEnd {
+		return nil, nil, 0, 0, nil
+	}
+
+	// Читаем keyLen (4 байта) — отдельным syscall'ом, потому что нужно знать
+	// размер блока key+opType+valLen, прежде чем читать его одним куском.
+	var buf4 [4]byte
+	m, readErr := it.r.ReadAt(buf4[:], it.offset)
+	if readErr != nil || m < 4 {
+		if readErr == io.EOF {
+			return nil, nil, 0, 0, nil // нормальный конец файла
+		}
+		if readErr != nil {
+			return nil, nil, 0, 0, readErr
+		}
+		return nil, nil, 0, 0, nil
+	}
+	keyLen := int(binary.LittleEndian.Uint32(buf4[:]))
+
+	// Один ReadAt на блок: key (keyLen) + opType (1) + valLen (4).
+	hdr := make([]byte, keyLen+1+4)
+	if _, readErr = it.r.ReadAt(hdr, it.offset+4); readErr != nil {
+		return nil, nil, 0, 0, fmt.Errorf("чтение key+op+valLen: %w", readErr)
+	}
+	key = hdr[:keyLen] // slice внутрь общего буфера — без копии
+	op = hdr[keyLen]
+	valLen := int(binary.LittleEndian.Uint32(hdr[keyLen+1:]))
+
+	// Читаем value одним ReadAt.
+	value = make([]byte, valLen)
+	if valLen > 0 {
+		if _, readErr = it.r.ReadAt(value, it.offset+4+int64(keyLen)+1+4); readErr != nil {
+			return nil, nil, 0, 0, fmt.Errorf("чтение value: %w", readErr)
+		}
+	}
+
+	// Суммарный размер записи: 4(keyLen) + keyLen + 1(opType) + 4(valLen) + valLen
+	totalSize := 4 + keyLen + 1 + 4 + valLen
+	return key, value, op, totalSize, nil
+}
+
+// readRecordLegacy — оставлена для сравнительного бенчмарка уровня C
+// (BenchmarkSSTable_ReadRecord). В продакшн-пути не используется.
+// Делает 5 отдельных ReadAt на запись — см. docs/note_day2.md.
+func (it *Iter) readRecordLegacy() (key, value []byte, op byte, n int, err error) {
 	// Защита: если не хватает байт даже для keyLen — данные закончились
 	if it.offset+4 > it.dataEnd {
 		return nil, nil, 0, 0, nil
